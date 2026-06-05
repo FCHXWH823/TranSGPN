@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+env/
+
+# Dataset
+dataset/
+
+# Model checkpoints
+checkpoints/
+
+# IDE
+.vscode/
+
+# Separate git repos
+aaai-2026-transgpn/
+Related-Papers/ICCAD2026_MCTS-PTNS/
+
+# macOS
+.DS_Store

@@ -1,0 +1,944 @@
+"""
+transnet/task.py
+
+GCPNTransNet: NLL pretraining task for transistor-network synthesis.
+
+Uses MPNN as backbone. Five policy heads:
+  mlp_stop  : graph_feat → 2          (stop / continue)
+  mlp_node1 : [node_feat, graph_feat] → 1  (source-node score)
+  mlp_node2 : [node1_feat, node_feat, graph_feat] → 1  (dest-node score)
+  mlp_var   : [node1_feat, node2_feat] → N_VARS   (variable index)
+  mlp_sign  : [node1_feat, node2_feat] → 2         (positive / negative)
+
+Node spaces in packed batch:
+  Actual nodes  : 0 .. total_nodes-1  (real G- and C-nodes)
+  Virtual nodes : total_nodes .. total_nodes+B-1  (one new-INTERNAL_G per graph)
+"""
+from __future__ import annotations
+
+import copy
+from collections import deque
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch_scatter import scatter_max
+from torch_scatter.composite import scatter_log_softmax
+
+from torchdrug import layers
+
+from .graph import build_gen_graph
+from .literal import N_VARS, check_safety, covered_patterns
+
+
+class TrajStep:
+    """One transistor-placement step in a generated trajectory.
+
+    Stores the graph state before the step plus the action taken, the
+    old log-prob from the agent, and all safety masks — so cur_logp can
+    be recomputed with the current (updated) model without re-running
+    safety checks.
+    """
+    __slots__ = (
+        "graph", "g_num",
+        "node1", "node2_ext", "node2_c",
+        "var_idx", "is_neg",
+        "old_logp",
+        "n1_mask", "n2_mask", "var_valid", "sign_valid",
+    )
+
+    def __init__(
+        self, graph, g_num,
+        node1, node2_ext, node2_c,
+        var_idx, is_neg, old_logp,
+        n1_mask, n2_mask, var_valid, sign_valid,
+    ):
+        self.graph      = graph
+        self.g_num      = g_num
+        self.node1      = node1
+        self.node2_ext  = node2_ext   # ext index: total_N = virtual new node
+        self.node2_c    = node2_c     # compact index: g_num = virtual new node
+        self.var_idx    = var_idx
+        self.is_neg     = is_neg
+        self.old_logp   = old_logp    # float, sum of 4 head log-probs from agent
+        self.n1_mask    = n1_mask     # [total_N+1] bool, CPU
+        self.n2_mask    = n2_mask     # [total_N+1] bool, CPU
+        self.var_valid  = var_valid   # [N_VARS] bool, CPU
+        self.sign_valid = sign_valid  # [2] bool, CPU (for chosen var_idx)
+
+
+class GCPNTransNet(nn.Module):
+    """
+    NLL pretraining wrapper around an MPNN backbone.
+
+    Args:
+        model        : MPNN instance (node_output_dim=h, output_dim=2h)
+        hidden_dim_mlp: hidden width of each policy MLP (default 128)
+    """
+
+    def __init__(self, model: nn.Module, hidden_dim_mlp: int = 128):
+        super().__init__()
+        self.model = model
+
+        h = model.node_output_dim   # per-node feature dim  (hidden_dim)
+        gh = model.output_dim       # graph feature dim      (2 * hidden_dim)
+
+        # One learnable embedding for the virtual new-node option
+        self.new_node_emb = nn.Parameter(torch.empty(h))
+        nn.init.normal_(self.new_node_emb, std=0.1)
+
+        MLP = layers.MultiLayerPerceptron
+        self.mlp_node1 = MLP(h + gh,     [hidden_dim_mlp, 1],      activation="tanh")
+        self.mlp_node2 = MLP(h + h + gh, [hidden_dim_mlp, 1],      activation="tanh")
+        self.mlp_var   = MLP(h + h,      [hidden_dim_mlp, N_VARS], activation="tanh")
+        self.mlp_sign  = MLP(h + h,      [hidden_dim_mlp, 2],      activation="tanh")
+
+        # Use object.__setattr__ so nn.Module does NOT register these as
+        # submodules — prevents keys from appearing in state_dict().
+        object.__setattr__(self, '_agent',  None)
+        object.__setattr__(self, '_best_t', {})   # fid -> best transistor count found
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Training entry point (called by Engine / training loop)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def forward(self, batch: dict):
+        return self.MLE_forward(batch)
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # NLL forward
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def MLE_forward(self, batch: dict):
+        graph            = batch["graph"]                    # PackedGraph
+        node1_lb         = batch["node1"].long()             # [B]  local compact index
+        node2_lb         = batch["node2"].long()             # [B]  local compact or g_num
+        var_lb           = batch["var"].long()               # [B]  global var idx
+        neg_lb           = batch["neg"].long()               # [B]  0=pos 1=neg
+        node2_safety_m   = batch["node2_safety_mask"].bool() # [B, MAX_G_NODES]
+        safety_mask      = batch["safety_mask"].bool()       # [B, N_VARS, 2]
+
+        device = next(self.parameters()).device
+        B = graph.batch_size
+        total_N = graph.num_node
+
+        # ── MPNN encoding ─────────────────────────────────────────────────
+        output     = self.model(graph, graph.node_feature.float())
+        node_feat  = output["node_feature"]   # [total_N, h]
+        graph_feat = output["graph_feature"]  # [B, 2h]
+
+        # ── Extended node space (actual + one virtual per graph) ───────────
+        virt_feat = self.new_node_emb.unsqueeze(0).expand(B, -1)  # [B, h]
+        ext_feat  = torch.cat([node_feat, virt_feat], dim=0)      # [total_N+B, h]
+
+        n2g      = graph.node2graph                                # [total_N]
+        ext_n2g  = torch.cat([n2g, torch.arange(B, device=device)])  # [total_N+B]
+        ext_gfeat = graph_feat[ext_n2g]                            # [total_N+B, 2h]
+
+        # ── G-node mask ────────────────────────────────────────────────────
+        starts      = graph.num_cum_nodes - graph.num_nodes        # [B]
+        local_idx   = torch.arange(total_N, device=device) - starts[n2g]
+        is_g_actual = local_idx < graph.g_num_nodes[n2g]          # [total_N]
+        is_g_ext    = torch.cat([is_g_actual,
+                                 torch.ones(B, dtype=torch.bool, device=device)])  # [total_N+B]
+
+        # ── Node-1 loss ────────────────────────────────────────────────────
+        n1_input  = torch.cat([ext_feat, ext_gfeat], dim=1)        # [total_N+B, h+2h]
+        n1_logits = self.mlp_node1(n1_input).squeeze(-1)           # [total_N+B]
+        n1_logits = n1_logits.masked_fill(~is_g_ext, -1e9)
+
+        node1_global = starts + node1_lb                           # [B]
+        n1_logprob   = scatter_log_softmax(n1_logits, ext_n2g)
+        loss_node1   = -(n1_logprob[node1_global]).mean()
+
+        # ── Node-2 loss ────────────────────────────────────────────────────
+        n1_feat_per_ext = node_feat[node1_global][ext_n2g]        # [total_N+B, h]
+        n2_input  = torch.cat([n1_feat_per_ext, ext_feat, ext_gfeat], dim=1)
+        n2_logits = self.mlp_node2(n2_input).squeeze(-1)
+        n2_logits = n2_logits.masked_fill(~is_g_ext, -1e9)
+
+        n2_exclude = torch.zeros(total_N + B, dtype=torch.bool, device=device)
+        n2_exclude[node1_global] = True
+        n2_logits = n2_logits.masked_fill(n2_exclude, -1e9)
+
+        # Mask out node2 candidates that have no safe literal for any (var, neg).
+        # node2_safety_m[b, j] = True iff compact-node j has ≥1 safe literal
+        #   given GT node1 and the partial graph for sample b.
+        # For actual G-nodes: compact index = local_idx (clamped for C-nodes, harmless).
+        # For virtual slots: compact index = g_num_nodes[b].
+        local_clamped   = local_idx.clamp(0, node2_safety_m.size(1) - 1)
+        n2_safe_actual  = node2_safety_m[n2g, local_clamped]                         # [total_N]
+        n2_safe_virtual = node2_safety_m[torch.arange(B, device=device),
+                                         graph.g_num_nodes.clamp(0, node2_safety_m.size(1) - 1)]  # [B]
+        n2_safe_ext     = torch.cat([n2_safe_actual, n2_safe_virtual], dim=0)         # [total_N+B]
+        n2_logits       = n2_logits.masked_fill(~n2_safe_ext, -1e9)
+
+        is_new_node  = node2_lb == graph.g_num_nodes
+        node2_global = torch.where(
+            is_new_node,
+            total_N + torch.arange(B, device=device),
+            starts + node2_lb,
+        )
+        n2_logprob = scatter_log_softmax(n2_logits, ext_n2g)
+        loss_node2 = -(n2_logprob[node2_global]).mean()
+
+        # ── Var + sign losses (safety-masked) ─────────────────────────────
+        edge_feat   = torch.cat([node_feat[node1_global],
+                                 ext_feat[node2_global]], dim=1)   # [B, 2h]
+        var_logits  = self.mlp_var(edge_feat)                      # [B, N_VARS]
+        sign_logits = self.mlp_sign(edge_feat)                     # [B, 2]
+
+        # Force GT always valid (GT transistors are always safe by construction,
+        # but guard against floating-point / dataset edge cases).
+        arange_B = torch.arange(B, device=device)
+        safety_mask = safety_mask.clone()
+        safety_mask[arange_B, var_lb, neg_lb] = True
+
+        var_valid    = safety_mask.any(dim=2)                      # [B, N_VARS]
+        var_logits_m = var_logits.masked_fill(~var_valid, -1e9)
+        loss_var     = F.nll_loss(F.log_softmax(var_logits_m, dim=-1), var_lb)
+
+        sign_valid    = safety_mask[arange_B, var_lb]              # [B, 2]
+        sign_logits_m = sign_logits.masked_fill(~sign_valid, -1e9)
+        loss_sign     = F.nll_loss(F.log_softmax(sign_logits_m, dim=-1), neg_lb)
+
+        # ── Aggregate ──────────────────────────────────────────────────────
+        total_loss = loss_node1 + loss_node2 + loss_var + loss_sign
+
+        metric = {
+            "loss/node1": loss_node1.item(),
+            "loss/node2": loss_node2.item(),
+            "loss/var":   loss_var.item(),
+            "loss/sign":  loss_sign.item(),
+            "loss/total": total_loss.item(),
+        }
+        metric.update(self._accuracy(
+            n1_logits, n2_logits, node1_global, node2_global,
+            var_lb, neg_lb, ext_n2g,
+        ))
+        return total_loss, metric
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # RL finetuning (off-policy PPO)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @property
+    def agent(self) -> "GCPNTransNet":
+        """Frozen copy of this model used for trajectory generation."""
+        if self._agent is None:
+            self.sync_agent()
+        return self._agent
+
+    def sync_agent(self) -> None:
+        """Replace frozen agent with a snapshot of current weights."""
+        # Temporarily clear _agent before deepcopy so the copy does not
+        # contain a nested _agent (which would itself contain _agent._agent, …).
+        object.__setattr__(self, '_agent', None)
+        new_agent = copy.deepcopy(self)
+        for p in new_agent.parameters():
+            p.requires_grad_(False)
+        new_agent.eval()
+        object.__setattr__(self, '_agent', new_agent)
+
+    def reinforce_forward(
+        self,
+        func_list,                  # list of (fid, vars_in_func, on_patterns, off_patterns, t_opt)
+        num_traj:       int   = 4,
+        max_steps:      int   = 30,
+        temperature:    float = 0.8,
+        clip_eps:       float = 0.2,
+        lambda_entropy: float = 0.01,
+    ) -> "torch.Tensor | None":
+        """
+        Off-policy PPO with GRPO baseline and terminal-only reward.
+
+        Reward:
+          terminal_r = best_T[fid] / T   if complete  (1.0 when T matches best ever)
+                     = 0.0                if partial
+          No per-step reward.  All steps in a trajectory receive terminal_r.
+
+        Baseline: GRPO — within-group mean of terminal_r across num_traj trajectories.
+        Once the model discovers a shorter circuit, best_T[fid] tightens automatically
+        so longer complete solutions are penalised in subsequent batches.
+        """
+        all_steps:      list[TrajStep] = []
+        all_advantages: list[float]    = []
+
+        with torch.no_grad():
+            for fid, vars_in_func, on_patterns, off_patterns, _t_opt in func_list:
+
+                # ── Generate all num_traj trajectories with ONE MPNN call/step
+                raw_trajs = []
+                for g_tran, g_num, status, steps in self._generate_K_trajs(
+                    vars_in_func, on_patterns, off_patterns,
+                    num_traj, max_steps, temperature
+                ):
+                    if not steps:
+                        continue
+                    T        = len(steps)
+                    cov      = covered_patterns(g_tran, g_num, on_patterns)
+                    complete = (cov == on_patterns)
+                    if complete:
+                        prev = self._best_t.get(fid)
+                        if prev is None or T < prev:
+                            self._best_t[fid] = T
+                    raw_trajs.append((T, complete, steps))
+
+                if not raw_trajs:
+                    continue
+
+                # ── Pass 2: assign terminal reward, compute GRPO advantage ─
+                best_T = self._best_t.get(fid)
+                rewards = []
+                for T, complete, steps in raw_trajs:
+                    if complete:
+                        r = (best_T / T) if best_T else 1.0
+                    else:
+                        r = 0.0
+                    rewards.append(r)
+
+                group_mean = sum(rewards) / len(rewards)
+                group_std  = (sum((r - group_mean) ** 2
+                                  for r in rewards) / len(rewards)) ** 0.5
+
+                for (T, complete, steps), r in zip(raw_trajs, rewards):
+                    adv = (r - group_mean) / (group_std + 1e-8)
+                    # same advantage for every step in this trajectory
+                    all_advantages.extend([adv] * T)
+                    all_steps.extend(steps)
+
+        if not all_steps:
+            return None
+
+        # Global normalization for stability across functions in the batch
+        adv_t = torch.tensor(all_advantages, dtype=torch.float)
+        adv_t = (adv_t - adv_t.mean()) / (adv_t.std() + 1e-8)
+        all_advantages = adv_t.tolist()
+
+        return self._ppo_loss_batched(all_steps, all_advantages, clip_eps, lambda_entropy)
+
+    def _ppo_loss_batched(
+        self,
+        steps: "list[TrajStep]",
+        advantages: "list[float]",
+        clip_eps: float,
+        lambda_entropy: float = 0.0,
+    ) -> torch.Tensor:
+        """
+        Compute PPO loss for all steps with a single batched MPNN forward pass.
+
+        All step graphs are packed into one PackedGraph; node features are then
+        sliced per step for the head MLPs.  Reduces S separate MPNN calls → 1.
+        """
+        from torchdrug import data as td_data
+
+        device = next(self.parameters()).device
+        S      = len(steps)
+
+        # ── Single MPNN forward over all step graphs ───────────────────────
+        packed   = td_data.Graph.pack([s.graph for s in steps]).to(device)
+        out      = self.model(packed, packed.node_feature.float())
+        nf_all   = out["node_feature"]   # [total_N_all, h]
+        gf_all   = out["graph_feature"]  # [S, 2h]
+
+        starts    = (packed.num_cum_nodes - packed.num_nodes).tolist()  # [S]
+        num_nodes = packed.num_nodes.tolist()                           # [S]
+
+        # ── Batch mlp_var and mlp_sign: all steps share the same edge_in dim ─
+        # We gather edge_in = [nf[node1], ext_feat[node2_ext]] for each step
+        # then run both MLPs in one call before the per-step logit indexing.
+        edge_ins = []
+        for i, step in enumerate(steps):
+            N_i   = num_nodes[i]
+            s_i   = starts[i]
+            nf_i  = nf_all[s_i : s_i + N_i]
+            virt  = self.new_node_emb.unsqueeze(0)
+            ext_i = torch.cat([nf_i, virt], dim=0)          # [N_i+1, h]
+            edge_ins.append(torch.cat([nf_i[step.node1], ext_i[step.node2_ext]], dim=0))
+
+        edge_in_batch = torch.stack(edge_ins, dim=0)         # [S, 2h]
+        var_logits_b  = self.mlp_var(edge_in_batch)          # [S, N_VARS]
+        sgn_logits_b  = self.mlp_sign(edge_in_batch)         # [S, 2]
+
+        # ── Per-step: n1, n2 heads (variable-size, cannot batch without padding) ─
+        pg_terms      = []
+        entropy_terms = []
+
+        def _entropy(logits):
+            """Categorical entropy, robust to -inf masked entries."""
+            p = F.softmax(logits, dim=0)
+            return -(p * (p + 1e-10).log()).sum()
+
+        for i, (step, adv) in enumerate(zip(steps, advantages)):
+            N_i   = num_nodes[i]
+            s_i   = starts[i]
+            nf_i  = nf_all[s_i : s_i + N_i]                 # [N_i, h]
+            gf_i  = gf_all[i]                                # [2h]
+            virt  = self.new_node_emb.unsqueeze(0)
+            ext_i = torch.cat([nf_i, virt], dim=0)           # [N_i+1, h]
+            ext_g = gf_i.unsqueeze(0).expand(N_i + 1, -1)   # [N_i+1, 2h]
+
+            n1_mask    = step.n1_mask.to(device)
+            n2_mask    = step.n2_mask.to(device)
+            var_valid  = step.var_valid.to(device)
+            sign_valid = step.sign_valid.to(device)
+
+            n1_logits = self.mlp_node1(
+                torch.cat([ext_i, ext_g], dim=1)
+            ).squeeze(-1).masked_fill(~n1_mask, -1e9)
+            lp = F.log_softmax(n1_logits, dim=0)[step.node1]
+
+            n1f_exp = nf_i[step.node1].unsqueeze(0).expand(N_i + 1, -1)
+            n2_logits = self.mlp_node2(
+                torch.cat([n1f_exp, ext_i, ext_g], dim=1)
+            ).squeeze(-1).masked_fill(~n2_mask, -1e9)
+            lp = lp + F.log_softmax(n2_logits, dim=0)[step.node2_ext]
+
+            var_logits_m = var_logits_b[i].masked_fill(~var_valid, -1e9)
+            sgn_logits_m = sgn_logits_b[i].masked_fill(~sign_valid, -1e9)
+
+            lp = lp + F.log_softmax(var_logits_m, dim=0)[step.var_idx]
+            lp = lp + F.log_softmax(sgn_logits_m, dim=0)[step.is_neg]
+
+            old_logp = torch.tensor(step.old_logp, device=device)
+            adv_t    = torch.tensor(adv, dtype=torch.float, device=device)
+            ratio    = (lp - old_logp).exp()
+            pg_terms.append(-torch.min(
+                ratio * adv_t,
+                ratio.clamp(1 - clip_eps, 1 + clip_eps) * adv_t,
+            ))
+
+            if lambda_entropy > 0:
+                entropy_terms.append(
+                    _entropy(n1_logits) + _entropy(n2_logits) +
+                    _entropy(var_logits_m) + _entropy(sgn_logits_m)
+                )
+
+        ppo_loss = torch.stack(pg_terms).mean()
+        if lambda_entropy > 0 and entropy_terms:
+            ppo_loss = ppo_loss - lambda_entropy * torch.stack(entropy_terms).mean()
+        return ppo_loss
+
+    @torch.no_grad()
+    def _generate_traj(self, vars_in_func, on_patterns, off_patterns, max_steps, temperature):
+        """Generate one trajectory using self.agent. Returns (g_tran, g_num, status, steps)."""
+        agent  = self.agent
+        device = next(self.parameters()).device
+        g_num  = 2
+        g_tran = []
+        steps  = []
+        added  = 0
+
+        while added < max_steps:
+            uncovered = on_patterns - covered_patterns(g_tran, g_num, on_patterns)
+
+            graph   = build_gen_graph(g_tran, g_num, vars_in_func, on_patterns).to(device)
+            out     = agent.model(graph, graph.node_feature.float())
+            nf      = out["node_feature"]
+            gf      = out["graph_feature"]
+            total_N = graph.num_node
+
+            virt_feat = agent.new_node_emb.unsqueeze(0)
+            ext_feat  = torch.cat([nf, virt_feat], dim=0)
+            ext_gf    = gf.expand(total_N + 1, -1)
+
+            reach   = _reachability_mask(g_tran, g_num, uncovered, device)
+            n1_mask = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+            n1_mask[:g_num] = reach
+            n1_in     = torch.cat([ext_feat, ext_gf], dim=1)
+            n1_logits = agent.mlp_node1(n1_in).squeeze(-1).masked_fill(~n1_mask, -1e9)
+            node1     = _pick(n1_logits, n1_mask, temperature, device)
+            lp_n1     = F.log_softmax(n1_logits, dim=0)[node1].item()
+
+            n2_mask = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+            n2_mask[:g_num]  = True
+            n2_mask[total_N] = True
+            n2_mask[node1]   = False
+
+            n2_has_safe = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+            for n2c in range(g_num + 1):
+                if n2c == node1:
+                    continue
+                ng2     = g_num + (1 if n2c == g_num else 0)
+                ext_idx = total_N if n2c == g_num else n2c
+                for vi in range(N_VARS):
+                    for ni in range(2):
+                        if check_safety(g_tran + [(node1, n2c, vi, ni)], ng2, off_patterns):
+                            n2_has_safe[ext_idx] = True
+                            break
+                    if n2_has_safe[ext_idx]:
+                        break
+
+            n2_mask = n2_mask & n2_has_safe
+            if not n2_mask.any():
+                break
+
+            n1f_exp   = nf[node1].unsqueeze(0).expand(total_N + 1, -1)
+            n2_in     = torch.cat([n1f_exp, ext_feat, ext_gf], dim=1)
+            n2_logits = agent.mlp_node2(n2_in).squeeze(-1).masked_fill(~n2_mask, -1e9)
+            node2     = _pick(n2_logits, n2_mask, temperature, device)
+            lp_n2     = F.log_softmax(n2_logits, dim=0)[node2].item()
+
+            is_new_node = (node2 == total_N)
+            node2_c   = g_num if is_new_node else node2
+            new_g_num = g_num + 1 if is_new_node else g_num
+
+            safety_m = torch.zeros(N_VARS, 2, dtype=torch.bool, device=device)
+            for vi in range(N_VARS):
+                for ni in range(2):
+                    if check_safety(g_tran + [(node1, node2_c, vi, ni)], new_g_num, off_patterns):
+                        safety_m[vi, ni] = True
+
+            if not safety_m.any():
+                break
+
+            edge_in    = torch.cat([nf[node1], ext_feat[node2]], dim=0).unsqueeze(0)
+            var_valid  = safety_m.any(dim=1)
+            var_logits = agent.mlp_var(edge_in).squeeze(0).masked_fill(~var_valid, -1e9)
+            var_idx    = _pick_simple(var_logits, temperature)
+            lp_var     = F.log_softmax(var_logits, dim=0)[var_idx].item()
+
+            sign_valid = safety_m[var_idx]
+            sgn_logits = agent.mlp_sign(edge_in).squeeze(0).masked_fill(~sign_valid, -1e9)
+            is_neg     = _pick_simple(sgn_logits, temperature)
+            lp_sign    = F.log_softmax(sgn_logits, dim=0)[is_neg].item()
+
+            steps.append(TrajStep(
+                graph      = graph.cpu(),
+                g_num      = g_num,
+                node1      = node1,
+                node2_ext  = node2,
+                node2_c    = node2_c,
+                var_idx    = var_idx,
+                is_neg     = is_neg,
+                old_logp   = lp_n1 + lp_n2 + lp_var + lp_sign,
+                n1_mask    = n1_mask.cpu(),
+                n2_mask    = n2_mask.cpu(),
+                var_valid  = var_valid.cpu(),
+                sign_valid = sign_valid.cpu(),
+            ))
+
+            g_tran.append((node1, node2_c, var_idx, is_neg))
+            g_num  = new_g_num
+            added += 1
+
+            if covered_patterns(g_tran, g_num, on_patterns) == on_patterns:
+                return g_tran, g_num, "complete", steps
+
+        status = "complete" if covered_patterns(g_tran, g_num, on_patterns) == on_patterns else "partial"
+        return g_tran, g_num, status, steps
+
+    @torch.no_grad()
+    def _generate_K_trajs(self, vars_in_func, on_patterns, off_patterns,
+                          K, max_steps, temperature):
+        """Generate K trajectories with a BATCHED MPNN forward at each step.
+
+        At step t, all K still-active trajectory graphs are packed into one
+        PackedGraph and processed with a SINGLE agent.model() call instead of
+        K separate calls.  This reduces MPNN invocations from K×T to T (where
+        T is the mean trajectory length), giving ~K× speedup on the dominant
+        cost (MPNN is 70% of wall time per the profiler).
+
+        Safety masks remain per-trajectory (sequential BFS) because they are
+        only 8% of wall time and cannot be trivially batched.
+
+        Returns: list of (g_tran, g_num, status, steps), length K.
+        """
+        from torchdrug import data as td_data
+
+        agent  = self.agent
+        device = next(self.parameters()).device
+
+        # ── Per-trajectory state ───────────────────────────────────────────
+        trajs = [{
+            "g_tran": [],
+            "g_num":  2,
+            "steps":  [],
+            "done":   False,
+            "status": "partial",
+        } for _ in range(K)]
+
+        for _ in range(max_steps):
+            active = [i for i, s in enumerate(trajs) if not s["done"]]
+            if not active:
+                break
+
+            # ── Build graphs for all active trajectories ───────────────────
+            graphs     = []
+            uncovereds = []
+            for i in active:
+                s = trajs[i]
+                unc = on_patterns - covered_patterns(s["g_tran"], s["g_num"],
+                                                     on_patterns)
+                uncovereds.append(unc)
+                graphs.append(
+                    build_gen_graph(s["g_tran"], s["g_num"],
+                                    vars_in_func, on_patterns)
+                )
+
+            # ── ONE batched MPNN forward for all active trajectories ────────
+            packed  = td_data.Graph.pack(graphs).to(device)
+            out     = agent.model(packed, packed.node_feature.float())
+            nf_all  = out["node_feature"]   # [total_N_all, h]
+            gf_all  = out["graph_feature"]  # [n_active, 2h]
+            starts    = (packed.num_cum_nodes - packed.num_nodes).tolist()
+            num_nodes = packed.num_nodes.tolist()
+
+            # ── Per-trajectory: heads + safety + action ────────────────────
+            for b, traj_idx in enumerate(active):
+                s        = trajs[traj_idx]
+                unc      = uncovereds[b]
+                g_tran   = s["g_tran"]
+                g_num    = s["g_num"]
+                N_i      = num_nodes[b]
+                s_i      = starts[b]
+                nf       = nf_all[s_i : s_i + N_i]
+                gf       = gf_all[b]
+                total_N  = N_i
+
+                virt_feat = agent.new_node_emb.unsqueeze(0)
+                ext_feat  = torch.cat([nf, virt_feat], dim=0)
+                ext_gf    = gf.expand(total_N + 1, -1)
+
+                # Node 1
+                reach   = _reachability_mask(g_tran, g_num, unc, device)
+                n1_mask = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+                n1_mask[:g_num] = reach
+                n1_in     = torch.cat([ext_feat, ext_gf], dim=1)
+                n1_logits = agent.mlp_node1(n1_in).squeeze(-1).masked_fill(~n1_mask, -1e9)
+                node1     = _pick(n1_logits, n1_mask, temperature, device)
+                lp_n1     = F.log_softmax(n1_logits, dim=0)[node1].item()
+
+                # Node 2 safety mask (BFS — cheap, ~6% of total time)
+                n2_mask = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+                n2_mask[:g_num]  = True
+                n2_mask[total_N] = True
+                n2_mask[node1]   = False
+                n2_has_safe = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+                for n2c in range(g_num + 1):
+                    if n2c == node1:
+                        continue
+                    ng2     = g_num + (1 if n2c == g_num else 0)
+                    ext_idx = total_N if n2c == g_num else n2c
+                    for vi in range(N_VARS):
+                        for ni in range(2):
+                            if check_safety(g_tran + [(node1, n2c, vi, ni)],
+                                            ng2, off_patterns):
+                                n2_has_safe[ext_idx] = True
+                                break
+                        if n2_has_safe[ext_idx]:
+                            break
+                n2_mask &= n2_has_safe
+                if not n2_mask.any():
+                    s["done"] = True
+                    continue
+
+                # Node 2
+                n1f_exp   = nf[node1].unsqueeze(0).expand(total_N + 1, -1)
+                n2_in     = torch.cat([n1f_exp, ext_feat, ext_gf], dim=1)
+                n2_logits = agent.mlp_node2(n2_in).squeeze(-1).masked_fill(~n2_mask, -1e9)
+                node2     = _pick(n2_logits, n2_mask, temperature, device)
+                lp_n2     = F.log_softmax(n2_logits, dim=0)[node2].item()
+
+                is_new_node = (node2 == total_N)
+                node2_c   = g_num if is_new_node else node2
+                new_g_num = g_num + 1 if is_new_node else g_num
+
+                # Var/sign safety mask (BFS — cheap, ~2% of total time)
+                safety_m = torch.zeros(N_VARS, 2, dtype=torch.bool, device=device)
+                for vi in range(N_VARS):
+                    for ni in range(2):
+                        if check_safety(g_tran + [(node1, node2_c, vi, ni)],
+                                        new_g_num, off_patterns):
+                            safety_m[vi, ni] = True
+                if not safety_m.any():
+                    s["done"] = True
+                    continue
+
+                # Var / sign
+                edge_in    = torch.cat([nf[node1], ext_feat[node2]], dim=0).unsqueeze(0)
+                var_valid  = safety_m.any(dim=1)
+                var_logits = agent.mlp_var(edge_in).squeeze(0).masked_fill(~var_valid, -1e9)
+                var_idx    = _pick_simple(var_logits, temperature)
+                lp_var     = F.log_softmax(var_logits, dim=0)[var_idx].item()
+                sign_valid = safety_m[var_idx]
+                sgn_logits = agent.mlp_sign(edge_in).squeeze(0).masked_fill(~sign_valid, -1e9)
+                is_neg     = _pick_simple(sgn_logits, temperature)
+                lp_sign    = F.log_softmax(sgn_logits, dim=0)[is_neg].item()
+
+                s["steps"].append(TrajStep(
+                    graph      = graphs[b].cpu(),
+                    g_num      = g_num,
+                    node1      = node1,
+                    node2_ext  = node2,
+                    node2_c    = node2_c,
+                    var_idx    = var_idx,
+                    is_neg     = is_neg,
+                    old_logp   = lp_n1 + lp_n2 + lp_var + lp_sign,
+                    n1_mask    = n1_mask.cpu(),
+                    n2_mask    = n2_mask.cpu(),
+                    var_valid  = var_valid.cpu(),
+                    sign_valid = sign_valid.cpu(),
+                ))
+                s["g_tran"].append((node1, node2_c, var_idx, is_neg))
+                s["g_num"] = new_g_num
+
+                if covered_patterns(s["g_tran"], s["g_num"], on_patterns) == on_patterns:
+                    s["done"]   = True
+                    s["status"] = "complete"
+
+        return [
+            (s["g_tran"], s["g_num"], s["status"], s["steps"])
+            for s in trajs
+        ]
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Generation
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def generate(
+        self,
+        vars_in_func,
+        on_patterns,
+        off_patterns,
+        num_sample: int = 20,
+        max_steps: int = 30,
+        temperature: float = 0.8,
+        verbose: int = 0,
+    ):
+        """
+        Generate transistor networks for a Boolean function.
+
+        Parameters
+        ----------
+        vars_in_func : list[str]   variables used in the function
+        on_patterns  : frozenset   input patterns where function = 1
+        off_patterns : frozenset   input patterns where function = 0
+        num_sample   : int         number of independent generation trials
+        max_steps    : int         max transistors added AND max consecutive
+                                   missed steps before declaring a dead end
+        temperature  : float       sampling temperature (0 = greedy)
+        verbose      : int         0=silent, 1=print per-trial line
+
+        Returns
+        -------
+        list of dicts, one per trial, with keys:
+            g_tran    – list of (u, v, var_idx, is_neg) in compact indices
+            g_num     – number of compact G-nodes
+            status    – 'complete' | 'partial'
+            n_covered – number of on-patterns covered
+            safe      – bool, no off-pattern path exists
+            correct   – bool, fully covers on-patterns and is safe
+        """
+        is_training = self.training
+        self.eval()
+
+        results = []
+        for i in range(num_sample):
+            g_tran, g_num, status = self._generate_once(
+                vars_in_func, on_patterns, off_patterns, max_steps, temperature
+            )
+            cov  = covered_patterns(g_tran, g_num, on_patterns)
+            safe = check_safety(g_tran, g_num, off_patterns)
+            correct = (cov == on_patterns) and safe
+            results.append({
+                "g_tran":    g_tran,
+                "g_num":     g_num,
+                "status":    status,
+                "n_covered": len(cov),
+                "safe":      safe,
+                "correct":   correct,
+            })
+            if verbose:
+                sym = "✓" if correct else "·"
+                print(f"  [{sym}] trial {i+1:2d}: {len(g_tran):2d} transistors, "
+                      f"coverage {len(cov)}/{len(on_patterns)}, "
+                      f"safe={safe}, status={status}")
+
+        self.train(is_training)
+        return results
+
+    def _generate_once(self, vars_in_func, on_patterns, off_patterns, max_steps, temperature):
+        """Single generation trial. Returns (g_tran, g_num, status).
+
+        max_steps counts transistors successfully added, not loop iterations.
+        Stops immediately if no safe literal exists for the sampled edge.
+        """
+        device = next(self.parameters()).device
+        g_num  = 2       # SOURCE=0, SINK=1
+        g_tran = []      # (u_compact, v_compact, var_idx, is_neg)
+
+        added = 0   # transistors successfully placed
+
+        while added < max_steps:
+            uncovered = on_patterns - covered_patterns(g_tran, g_num, on_patterns)
+
+            graph = build_gen_graph(g_tran, g_num, vars_in_func, on_patterns).to(device)
+            out   = self.model(graph, graph.node_feature.float())
+            nf    = out["node_feature"]   # [total_N, h]
+            gf    = out["graph_feature"]  # [1, 2h]
+            total_N = graph.num_node
+
+            virt_feat = self.new_node_emb.unsqueeze(0)
+            ext_feat  = torch.cat([nf, virt_feat], dim=0)   # [total_N+1, h]
+            ext_gf    = gf.expand(total_N + 1, -1)          # [total_N+1, 2h]
+
+            # ── Node 1: reachability-masked ────────────────────────────────
+            reach   = _reachability_mask(g_tran, g_num, uncovered, device)
+            n1_mask = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+            n1_mask[:g_num] = reach
+            n1_in     = torch.cat([ext_feat, ext_gf], dim=1)
+            n1_logits = self.mlp_node1(n1_in).squeeze(-1)
+            n1_logits = n1_logits.masked_fill(~n1_mask, -1e9)
+            node1 = _pick(n1_logits, n1_mask, temperature, device)
+
+            # ── Node 2: mask candidates that have no safe literal ─────────
+            # For each candidate node2, check if ≥1 (var, neg) is safe.
+            # Only candidates with at least one safe literal are selectable.
+            n2_mask = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+            n2_mask[:g_num] = True
+            n2_mask[total_N] = True
+            n2_mask[node1]   = False
+
+            n2_has_safe = torch.zeros(total_N + 1, dtype=torch.bool, device=device)
+            for n2c in range(g_num + 1):          # 0..g_num-1 existing, g_num = virtual
+                if n2c == node1:
+                    continue
+                ng2     = g_num + (1 if n2c == g_num else 0)
+                ext_idx = total_N if n2c == g_num else n2c
+                for vi in range(N_VARS):
+                    for ni in range(2):
+                        if check_safety(g_tran + [(node1, n2c, vi, ni)], ng2, off_patterns):
+                            n2_has_safe[ext_idx] = True
+                            break
+                    if n2_has_safe[ext_idx]:
+                        break
+
+            n2_mask = n2_mask & n2_has_safe
+            if not n2_mask.any():
+                break  # no node2 candidate has any safe literal → dead end
+
+            n1f_exp   = nf[node1].unsqueeze(0).expand(total_N + 1, -1)
+            n2_in     = torch.cat([n1f_exp, ext_feat, ext_gf], dim=1)
+            n2_logits = self.mlp_node2(n2_in).squeeze(-1)
+            n2_logits = n2_logits.masked_fill(~n2_mask, -1e9)
+            node2 = _pick(n2_logits, n2_mask, temperature, device)
+
+            # ── Resolve compact node2 ──────────────────────────────────────
+            is_new_node = (node2 == total_N)
+            node2_c   = g_num if is_new_node else node2
+            new_g_num = g_num + 1 if is_new_node else g_num
+
+            # ── var/sign safety mask for the chosen (node1, node2) ────────
+            safety_m = torch.zeros(N_VARS, 2, dtype=torch.bool, device=device)
+            for vi in range(N_VARS):
+                for ni in range(2):
+                    if check_safety(
+                        g_tran + [(node1, node2_c, vi, ni)],
+                        new_g_num, off_patterns,
+                    ):
+                        safety_m[vi, ni] = True
+
+            if not safety_m.any():
+                break  # guard: should not trigger given n2_has_safe check above
+
+            # ── Sample var and sign from safe set ─────────────────────────
+            edge_in    = torch.cat([nf[node1], ext_feat[node2]], dim=0).unsqueeze(0)
+            var_logits = self.mlp_var(edge_in).squeeze(0)
+            sgn_logits = self.mlp_sign(edge_in).squeeze(0)
+
+            var_valid = safety_m.any(dim=1)
+            var_idx   = _pick_simple(var_logits.masked_fill(~var_valid, -1e9), temperature)
+            is_neg    = _pick_simple(sgn_logits.masked_fill(~safety_m[var_idx], -1e9), temperature)
+
+            # ── Add transistor (safe by construction) ─────────────────────
+            g_tran.append((node1, node2_c, var_idx, is_neg))
+            g_num  = new_g_num
+            added += 1
+
+            if covered_patterns(g_tran, g_num, on_patterns) == on_patterns:
+                return g_tran, g_num, "complete"
+
+        status = "complete" if covered_patterns(g_tran, g_num, on_patterns) == on_patterns else "partial"
+        return g_tran, g_num, status
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Accuracy metrics
+    # ─────────────────────────────────────────────────────────────────────────
+
+    @torch.no_grad()
+    def _accuracy(
+        self,
+        n1_logits, n2_logits, node1_global, node2_global,
+        var_lb, neg_lb, ext_n2g,
+    ):
+        n1_pred = _scatter_argmax(n1_logits, ext_n2g, n1_logits.shape[0])
+        n2_pred = _scatter_argmax(n2_logits, ext_n2g, n2_logits.shape[0])
+        return {
+            "acc/node1": (n1_pred == node1_global).float().mean().item(),
+            "acc/node2": (n2_pred == node2_global).float().mean().item(),
+        }
+
+
+def _pick(logits, mask, temperature, device):
+    """Masked argmax or multinomial sampling."""
+    valid = mask.nonzero(as_tuple=True)[0]
+    if temperature <= 0:
+        return logits.argmax().item()
+    probs = F.softmax(logits[valid] / temperature, dim=-1)
+    return valid[torch.multinomial(probs, 1).item()].item()
+
+
+def _pick_simple(logits, temperature):
+    if temperature <= 0:
+        return logits.argmax().item()
+    return torch.multinomial(F.softmax(logits / temperature, dim=-1), 1).item()
+
+
+def _reachability_mask(g_tran, g_num, uncovered, device):
+    """
+    [g_num] bool — True if a G-node is reachable from SRC (0) or SNK (1)
+    via transistors that are active under at least one uncovered on-pattern.
+    SRC and SNK are always True.  Used to prune node1 candidates.
+    """
+    mask = torch.zeros(g_num, dtype=torch.bool, device=device)
+    mask[0] = True
+    mask[1] = True
+    if not g_tran or not uncovered:
+        return mask  # only SRC/SNK exist, or nothing is uncovered
+
+    for pat in uncovered:
+        adj: list[list[int]] = [[] for _ in range(g_num)]
+        for u, v, var_idx, is_neg in g_tran:
+            val = pat[var_idx]
+            if (is_neg == 0 and val == 1) or (is_neg == 1 and val == 0):
+                adj[u].append(v)
+                adj[v].append(u)
+        for start in (0, 1):
+            visited: set[int] = {start}
+            q: deque[int] = deque([start])
+            while q:
+                n = q.popleft()
+                for nb in adj[n]:
+                    if nb not in visited:
+                        visited.add(nb)
+                        q.append(nb)
+            for n in visited:
+                mask[n] = True
+
+    return mask
+
+
+
+def _scatter_argmax(
+    src: torch.Tensor,
+    index: torch.Tensor,
+    total_nodes: int,
+) -> torch.Tensor:
+    """
+    Return the global argmax position within each group defined by `index`.
+    Returns tensor of shape [num_groups].
+    """
+    B = int(index.max().item()) + 1
+    _, argmax = scatter_max(src, index, dim_size=B)
+    return argmax  # [B] global position of max in src for each group

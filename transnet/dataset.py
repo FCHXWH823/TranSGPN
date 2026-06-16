@@ -22,20 +22,19 @@ from typing import List
 
 import torch
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
-from .graph import MAX_G_NODES, build_prefix_graph, sorted_g_transistors
+from .graph import MAX_G_NODES, build_gen_graph, build_prefix_graph, sorted_g_transistors
 from .literal import (
-    N_VARS,
-    check_safety, decode_literal, extract_vars, on_off_split, parse_sop_expr,
+    ALL_VARS, N_VARS,
+    check_safety, covered_patterns, decode_literal, extract_vars, on_off_split, parse_sop_expr,
 )
 
 
-_CSV_PATH = os.path.join(
-    os.path.dirname(__file__), "..", "dataset", "sweep_3input", "aggregate.csv"
-)
-_DATA_ROOT = os.path.join(
-    os.path.dirname(__file__), "..", "dataset", "sweep_3input"
-)
+_DATASET_ROOTS = [
+    os.path.join(os.path.dirname(__file__), "..", "dataset", "sweep_3input"),
+    os.path.join(os.path.dirname(__file__), "..", "dataset", "sweep_4input_possani"),
+]
 
 
 def _parse_cg(cg_str: str):
@@ -49,46 +48,130 @@ def _parse_cg(cg_str: str):
     return nc, tr
 
 
-def _read_expr(function_id: str, t: str) -> str:
+def _read_expr(data_root: str, function_id: str, subdir: str) -> str:
     """Read SOP expression from Booleans.txt."""
-    path = os.path.join(_DATA_ROOT, function_id, f"t_{t}", "Booleans.txt")
+    path = os.path.join(data_root, function_id, subdir, "Booleans.txt")
     with open(path) as f:
         line = f.read().strip()
-    # Format: " PF3_XXX(t): <expr>"
+    # Format: "PF3_XXX(t): <expr>"  or  "PF4_XXX(t): <expr>"
     return line.split(": ", 1)[1].strip()
+
+
+def _is_4input_csv(csv_path: str) -> bool:
+    """Detect format by checking for 'impl_idx' column in header."""
+    with open(csv_path) as f:
+        header = f.readline()
+    return "impl_idx" in header
 
 
 class TransistorDataset(Dataset):
     """
     Pre-expanded BFS prefix training dataset for transistor-network synthesis.
 
-    Each Boolean function from aggregate.csv produces R samples (one per
-    G-transistor in snake-sort order).
+    Supports sweep_3input (status=SAT, t_N/ subdirs) and
+    sweep_4input_possani (status=OK, impl_N/ subdirs, sop column).
     """
 
-    def __init__(self, csv_path: str = _CSV_PATH):
+    def __init__(self, dataset_roots: List[str] = None, cache_path: str = None,
+                 verify: bool = True):
+        if dataset_roots is None:
+            dataset_roots = _DATASET_ROOTS
         self.samples: List[dict] = []
-        self._load(csv_path)
 
-    def _load(self, csv_path: str) -> None:
+        if cache_path and os.path.exists(cache_path):
+            print(f"Loading dataset from cache: {cache_path}")
+            raw = torch.load(cache_path, weights_only=False)
+            print(f"  {len(raw)} samples loaded, rebuilding graphs …")
+            self.samples = self._build_graphs(raw, desc="Rebuilding graphs")
+            return
+
+        # Full build from CSVs (slow — BFS safety checks)
+        raw: List[dict] = []
+        for root in dataset_roots:
+            csv_path = os.path.join(root, "aggregate.csv")
+            if not os.path.exists(csv_path):
+                continue
+            self._load(root, csv_path, raw, verify=verify)
+
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
+            print(f"Saving dataset cache to: {cache_path}")
+            torch.save(raw, cache_path)
+            print(f"  Saved {len(raw)} raw samples.")
+
+        self.samples = self._build_graphs(raw, desc="Building graphs")
+
+    @staticmethod
+    def _build_graphs(raw: List[dict], desc: str = "Building graphs") -> List[dict]:
+        """Reconstruct Graph objects from raw data (no BFS, fast)."""
+        samples = []
+        for entry in tqdm(raw, desc=desc, unit="sample"):
+            on_patterns = frozenset(map(tuple, entry["on_patterns"]))
+            graph = build_gen_graph(
+                entry["compact_tran"], entry["g_num"],
+                entry["vars_in_func"], on_patterns,
+            )
+            samples.append({
+                "graph":             graph,
+                "node1":             entry["node1"],
+                "node2":             entry["node2"],
+                "var":               entry["var"],
+                "neg":               entry["neg"],
+                "node2_safety_mask": entry["node2_safety_mask"],
+                "safety_mask":       entry["safety_mask"],
+            })
+        return samples
+
+    def _load(self, data_root: str, csv_path: str, raw: List[dict],
+              verify: bool = True) -> None:
+        is_4input = _is_4input_csv(csv_path)
+        sat_status = "OK" if is_4input else "SAT"
+
         with open(csv_path, newline="") as f:
             reader = csv.DictReader(f)
-            rows = [r for r in reader if r["status"] == "SAT"]
+            rows = [r for r in reader if r["status"] == sat_status]
 
-        for row in rows:
+        dataset_name = os.path.basename(data_root)
+        n_fail = 0
+        for row in tqdm(rows, desc=f"BFS {dataset_name}", unit="fn"):
             fid = row["function_id"]
-            t = row["t"]
             nc, tr = _parse_cg(row["cg"])
-            expr = _read_expr(fid, t)
-            vars_in_func = extract_vars(expr)
+            if is_4input:
+                expr = row["sop"]
+                subdir = f"impl_{row['impl_idx']}"
+                # 4-input uses global literal IDs (a=0..d=3, !a=4..!d=7)
+                # so vars_in_func must always be ALL_VARS for correct decoding
+                vars_in_func = ALL_VARS
+            else:
+                subdir = f"t_{row['t']}"
+                expr = _read_expr(data_root, fid, subdir)
+                vars_in_func = extract_vars(expr)
             on_patterns = parse_sop_expr(expr, vars_in_func)
-            off_patterns = on_off_split(on_patterns)[1]
+            _, off_patterns = on_off_split(on_patterns)
 
             s_tr = sorted_g_transistors(tr, nc)
             R = len(s_tr)
 
+            if verify:
+                # Decode full network into compact (u, v, gv, neg) format
+                full_compact = [
+                    (u, v, *decode_literal(lit, vars_in_func))
+                    for u, v, lit in s_tr
+                ]
+                covered = covered_patterns(full_compact, nc, on_patterns)
+                missing  = on_patterns - covered
+                safe     = check_safety(full_compact, nc, off_patterns)
+                if missing or not safe:
+                    n_fail += 1
+                    issues = []
+                    if missing:
+                        issues.append(f"missing on-patterns: {sorted(missing)}")
+                    if not safe:
+                        issues.append("conducts under off-pattern")
+                    print(f"\n  [VERIFY FAIL] {fid} ({expr}): {'; '.join(issues)}")
+
             for k in range(R):
-                graph, g2c, g_num = build_prefix_graph(
+                _, g2c, g_num = build_prefix_graph(
                     s_tr, k, vars_in_func, on_patterns
                 )
                 u, v, lit_id = s_tr[k]
@@ -107,7 +190,7 @@ class TransistorDataset(Dataset):
                 else:
                     raise ValueError(
                         f"Both endpoints ({lo},{h}) of sorted_tr[{k}] are new "
-                        f"in function {fid} t={t}. This should not occur after "
+                        f"in function {fid} subdir={subdir}. This should not occur after "
                         f"filtering disconnected transistors."
                     )
                 gv, neg = decode_literal(lit_id, vars_in_func)
@@ -118,9 +201,8 @@ class TransistorDataset(Dataset):
                 ]
 
                 # node2 safety mask: for each candidate node2, is there ≥1 safe literal?
-                # Shape [MAX_G_NODES]: index = compact node2 (g_num = virtual new node).
                 node2_safety_mask = torch.zeros(MAX_G_NODES, dtype=torch.bool)
-                for n2c in range(g_num + 1):      # 0..g_num-1 existing, g_num = virtual
+                for n2c in range(g_num + 1):
                     if n2c == node1:
                         continue
                     ng2 = g_num + (1 if n2c == g_num else 0)
@@ -131,9 +213,9 @@ class TransistorDataset(Dataset):
                                 break
                         if node2_safety_mask[n2c]:
                             break
-                node2_safety_mask[node2] = True    # GT node2 always valid
+                node2_safety_mask[node2] = True
 
-                # var/sign safety mask: for the GT (node1, node2), which literals are safe?
+                # var/sign safety mask for the GT (node1, node2)
                 new_g_num_k = g_num + (1 if node2 == g_num else 0)
                 safety_mask = torch.zeros(N_VARS, 2, dtype=torch.bool)
                 for vi in range(N_VARS):
@@ -144,8 +226,12 @@ class TransistorDataset(Dataset):
                         ):
                             safety_mask[vi, ni] = True
 
-                self.samples.append({
-                    "graph":             graph,
+                # Store raw data only — Graph objects are rebuilt from this in _build_graphs
+                raw.append({
+                    "compact_tran": compact_k,
+                    "g_num":        g_num,
+                    "vars_in_func": vars_in_func,
+                    "on_patterns":  tuple(on_patterns),   # frozenset → serializable tuple
                     "node1":             node1,
                     "node2":             node2,
                     "var":               gv,
@@ -153,6 +239,10 @@ class TransistorDataset(Dataset):
                     "node2_safety_mask": node2_safety_mask,
                     "safety_mask":       safety_mask,
                 })
+
+        if verify:
+            status = "OK" if n_fail == 0 else f"{n_fail} FAILURES"
+            print(f"  Verification {dataset_name}: {len(rows)} networks checked — {status}")
 
     def __len__(self) -> int:
         return len(self.samples)

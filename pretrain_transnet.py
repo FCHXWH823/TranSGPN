@@ -18,13 +18,17 @@ from transnet import GCPNTransNet, TransistorDataset
 # ── CLI args ────────────────────────────────────────────────────────────────
 parser = argparse.ArgumentParser()
 parser.add_argument("--epochs",     type=int,   default=50)
-parser.add_argument("--batch-size", type=int,   default=64)
-parser.add_argument("--lr",         type=float, default=1e-3)
+parser.add_argument("--batch-size",   type=int,   default=64)
+parser.add_argument("--num-workers",  type=int,   default=0,
+                    help="DataLoader worker processes. Set to 4-8 when training on GPU.")
+parser.add_argument("--lr",           type=float, default=1e-3)
 parser.add_argument("--hidden",     type=int,   default=64,  help="MPNN hidden dim")
 parser.add_argument("--num-layer",  type=int,   default=3,   help="MPNN message-passing layers")
 parser.add_argument("--mlp-hidden", type=int,   default=128, help="Policy MLP hidden dim")
-parser.add_argument("--checkpoint", type=str,   default="checkpoints/transnet_pretrain.pt")
-parser.add_argument("--log-interval", type=int, default=20)
+parser.add_argument("--checkpoint",   type=str,   default="checkpoints/transnet_pretrain_3_4input_v1.pt")
+parser.add_argument("--cache",        type=str,   default="dataset/cache_3_4input.pt",
+                    help="Path to save/load preprocessed dataset cache (saves ~56 min on reload).")
+parser.add_argument("--log-interval", type=int,   default=20)
 args = parser.parse_args()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -32,14 +36,14 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ── Dataset ──────────────────────────────────────────────────────────────────
 print("Loading TransistorDataset …")
 t0 = time.time()
-dataset = TransistorDataset()
+dataset = TransistorDataset(cache_path=args.cache)
 print(f"  {len(dataset)} prefix samples  ({time.time()-t0:.1f}s)")
 
 loader = td_data.DataLoader(
     dataset,
     batch_size=args.batch_size,
     shuffle=True,
-    num_workers=0,
+    num_workers=args.num_workers,
 )
 
 # ── Model ────────────────────────────────────────────────────────────────────

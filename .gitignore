@@ -10,8 +10,10 @@ build/
 # Virtual environment
 env/
 
-# Dataset
-dataset/
+# Dataset — ignore large per-function subdirs and caches, keep aggregate CSVs
+dataset/sweep_3input/[0-9]*/
+dataset/sweep_4input_possani/[0-9]*/
+dataset/cache_*.pt
 
 # Model checkpoints
 checkpoints/
@@ -20,7 +22,6 @@ checkpoints/
 .vscode/
 
 # Separate git repos
-aaai-2026-transgpn/
 Related-Papers/ICCAD2026_MCTS-PTNS/
 
 # macOS

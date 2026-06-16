@@ -72,11 +72,12 @@ def sorted_g_transistors(
     nc: int,
 ) -> List[Tuple[int, int, int]]:
     """
-    Remap CG dataset transistors to unified node indices and sort by
-    snake-pattern undirected_id.
+    Remap CG dataset transistors to unified node indices and sort in
+    BFS-connected order from SOURCE/SINK, using snake_id as a tiebreaker.
 
-    Only transistors where both endpoints can reach SOURCE and SINK are
-    kept — isolated / dead-end transistors are excluded.
+    Pure snake ordering is not used because it does not guarantee that the
+    first transistor touches SOURCE(0) or SINK(1) — this fails for 4-input
+    networks where SOURCE connects to high-indexed (high snake_id) nodes.
 
     Dataset remapping:
       dataset node 0     → 0   (SOURCE)
@@ -95,7 +96,24 @@ def sorted_g_transistors(
         for s, d, lit in tr
         if s in useful and d in useful
     ]
-    return sorted(remapped, key=lambda e: _snake_id(e[0], e[1]))
+
+    # BFS-connected ordering: each transistor k has ≥1 endpoint already visited.
+    visited: Set[int] = {0, 1}
+    pending = sorted(remapped, key=lambda e: _snake_id(e[0], e[1]))
+    result: List[Tuple[int, int, int]] = []
+
+    while pending:
+        for i, (u, v, lit) in enumerate(pending):
+            if u in visited or v in visited:
+                result.append((u, v, lit))
+                visited.update([u, v])
+                pending.pop(i)
+                break
+        else:
+            result.extend(pending)   # disconnected tail (should not happen)
+            break
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

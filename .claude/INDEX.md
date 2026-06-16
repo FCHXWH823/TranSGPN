@@ -12,6 +12,7 @@
 | [model_architecture.md](model_architecture.md) | MPNN backbone, 5 policy heads (dims, inputs, outputs), virtual node, safety masks, reachability mask, agent/model split, NLL forward |
 | [graph_representation.md](graph_representation.md) | Switching graph concept, G∪C unified node layout, node/edge features, C-network (SOP compensate), literal encoding, BFS safety & coverage, graph builder functions |
 | [training_phase1_pretrain.md](training_phase1_pretrain.md) | NLL supervised pretraining, dataset, loss formulation, commands, checkpoint progression, how downstream scripts load the pretrain |
+| [training_combined_datasets.md](training_combined_datasets.md) | Combined 3-input+4-input training: literal indexing differences, N_VARS=4 model, cache system, GPU commands, profiling results |
 | [training_phase2_rl.md](training_phase2_rl.md) | PPO with GRPO baseline, terminal-only reward, entropy bonus, K-trajectory batching, batched PPO loss, NLL regularization, hyperparameters, XOR vs all-function comparison |
 | [training_phase3_physical_rl.md](training_phase3_physical_rl.md) | Physical RL via ASTRAN, PDN/PUN dual synthesis, ASTRAN objective, adaptive reward, parallel ASTRAN eval, current status |
 | [astran_integration.md](astran_integration.md) | ASTRAN binary path, correct invocation (`--shell`), script format, SPICE requirements (VCC/GND, NMOS_VTL/PMOS_VTL), output parsing, CPP formula, all bugs fixed |

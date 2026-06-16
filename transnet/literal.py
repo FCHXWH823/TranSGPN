@@ -17,9 +17,9 @@ import itertools
 from collections import deque
 from typing import List, Tuple, FrozenSet
 
-ALL_VARS = ['a', 'b', 'c']   # variable names for sweep_3input (N=3)
-N_VARS = len(ALL_VARS)
-EDGE_FEAT_DIM = N_VARS + 2   # 5
+ALL_VARS = ['a', 'b', 'c', 'd']  # max 4 variables (3-input uses first 3 only)
+N_VARS = len(ALL_VARS)            # 4
+EDGE_FEAT_DIM = N_VARS + 2        # 6
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +28,7 @@ EDGE_FEAT_DIM = N_VARS + 2   # 5
 
 def extract_vars(expr: str) -> List[str]:
     """Return sorted variable names that appear in SOP expression."""
-    return sorted(set(re.findall(r'[a-c]', expr)))
+    return sorted(set(re.findall(r'[a-d]', expr)))
 
 
 def decode_literal(lit_id: int, vars_in_func: List[str]) -> Tuple[int, int]:
@@ -74,7 +74,7 @@ def parse_sop_expr(expr: str, vars_in_func: List[str]) -> FrozenSet[Tuple[int, .
 
     for term in expr.split('+'):
         term = term.strip()
-        lits = re.findall(r'!?[a-c]', term)
+        lits = re.findall(r'!?[a-d]', term)
         # iterate over all K-local assignments
         for local_pat in itertools.product([0, 1], repeat=K):
             ctx = {vars_in_func[i]: local_pat[i] for i in range(K)}

@@ -26,3 +26,12 @@ Related-Papers/ICCAD2026_MCTS-PTNS/
 
 # macOS
 .DS_Store
+
+# Run artifacts (added for upload)
+*.10g
+downloads/
+results/shards/
+results/rl_finetune/
+results/*.bak.csv
+checkpoints/rl_targets/
+checkpoints/rl_targets_val/

@@ -1,0 +1,25 @@
+# TranSGPN dependencies (for laptop inference / testing)
+#
+# CPU-only laptop install (no CUDA):
+#   pip install torch==2.5.1
+#   pip install torch-scatter torch-cluster torch-sparse torch-spline-conv \
+#       -f https://data.pyg.org/whl/torch-2.5.1+cpu.html
+#   pip install "numpy<2" torchdrug tqdm
+#
+# IMPORTANT: install torch FIRST and the torch-* PyG wheels SECOND (from the -f
+# index), otherwise pip tries to build them from source and fails. numpy must be
+# <2 (rdkit-pypi pulled by torchdrug is built against numpy 1.x).
+#
+# Then test the pretrained model, e.g.:
+#   python generate_transnet.py \
+#       --checkpoint checkpoints/transnet_pretrain_3_4input_v1.pt \
+#       --expr "!a*!b*c+!a*b*!c+a*!b*!c+a*b*c" --trials 50
+
+torch==2.5.1
+torch-scatter
+torch-cluster
+torch-sparse
+torch-spline-conv
+numpy<2
+torchdrug
+tqdm

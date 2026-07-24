@@ -47,9 +47,9 @@ from transnet.task import GCPNTransNet
 _DATA_ROOT  = os.path.join(os.path.dirname(__file__), "dataset", "sweep_3input")
 _CSV_PATH   = os.path.join(_DATA_ROOT, "aggregate.csv")
 _ASTRAN_BIN = os.path.join(os.path.dirname(__file__),
-              "astran/Astran/build/bin/Astran.app/Contents/MacOS/Astran")
+              "astran/Astran/build/bin/Astran")           # Linux CLI build
 _TECH_FILE  = os.path.join(os.path.dirname(__file__),
-              "astran/Astran/build/Work/tech_freePDK45.rul")
+              "astran/Astran/tech_freePDK45.rul")
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────

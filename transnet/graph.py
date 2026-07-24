@@ -26,8 +26,12 @@ from .literal import (
     build_sop_edges, decode_literal, make_edge_feat,
 )
 
+import os
+
 NODE_FEAT_DIM = 4
-MAX_G_NODES   = 20   # upper bound on compact G-node count (SRC + SNK + INTERNAL_G)
+# Upper bound on compact G-node count (SRC + SNK + INTERNAL_G). Configurable via
+# env because 6-input networks can have more internal nodes than 4-input ones.
+MAX_G_NODES   = int(os.environ.get("TRANSGPN_MAX_G_NODES", "20"))
 _SRC, _SNK, _G, _C = 0, 1, 2, 3
 
 
@@ -116,6 +120,228 @@ def sorted_g_transistors(
     return result
 
 
+def path_sorted_g_transistors(
+    tr: List[Tuple[int, int, int]],
+    nc: int,
+) -> List[Tuple[int, int, int]]:
+    """
+    Path/ear-decomposition ordering (DFS-like): emit transistors as directed
+    walks that mirror how conduction paths are actually built.
+
+    The first walk starts at SOURCE and extends through unvisited nodes until
+    it closes into visited structure (ideally SNK) — one complete path. Each
+    subsequent walk (an "ear") starts at an already-visited node and again
+    extends until it reconnects. Unlike snake-BFS ordering, at any prefix
+    there is at most ONE dangling stub and it is the next attach point — the
+    node1 label becomes structurally determined instead of an index-convention
+    artifact, and the order matches the task semantics (coverage accrues by
+    completing SRC-SNK paths).
+
+    Returns (attach, other, lit) tuples in construction order, where `attach`
+    is ALWAYS already visited at emission time. Walk direction is meaningful:
+    dataset labeling must use tuple order (node1=attach), not the lo/hi rule.
+    """
+    from collections import defaultdict
+
+    useful = _src_snk_reachable(tr, nc)
+
+    def remap(k: int) -> int:
+        if k == 0:       return 0
+        if k == nc - 1:  return 1
+        return k + 1
+
+    edges = [(remap(s), remap(d), lit)
+             for s, d, lit in tr if s in useful and d in useful]
+
+    adj: Dict[int, List[Tuple[int, int]]] = defaultdict(list)
+    for i, (u, v, _lit) in enumerate(edges):
+        adj[u].append((v, i))
+        adj[v].append((u, i))
+
+    used = [False] * len(edges)
+    visited: Set[int] = {0, 1}
+    result: List[Tuple[int, int, int]] = []
+
+    def walk(start: int) -> None:
+        cur = start
+        while True:
+            nxts = sorted((n, i) for n, i in adj[cur] if not used[i])
+            if not nxts:
+                return
+            unv = [(n, i) for n, i in nxts if n not in visited]
+            if unv:
+                n, i = unv[0]
+            else:
+                # closing the walk: prefer completing a conduction path at
+                # SNK(1), then interior nodes, and only lastly loop into SRC(0)
+                n, i = min(nxts, key=lambda t: (t[0] != 1, t[0] == 0, t))
+            used[i] = True
+            result.append((cur, n, edges[i][2]))
+            closed = n in visited
+            visited.add(n)
+            if closed:
+                return          # walk reconnected into existing structure
+            cur = n
+
+    while len(result) < len(edges):
+        starts = sorted(n for n in visited
+                        if any(not used[i] for _n, i in adj[n]))
+        if not starts:
+            # disconnected leftovers (should not happen after pruning)
+            for i, (u, v, lit) in enumerate(edges):
+                if not used[i]:
+                    used[i] = True
+                    result.append((u, v, lit))
+                    visited.update([u, v])
+            break
+        walk(starts[0])
+
+    assert len(result) == len(edges), "path ordering lost transistors"
+    return result
+
+
+def prune_gtran(g_tran, g_num: int):
+    """Keep EXACTLY the transistors lying on >=1 simple SRC(0)-SNK(1) path.
+
+    Everything else (dangling stubs, pendant parallel pairs, dangling cycles,
+    disconnected islands) cannot conduct and is physically free to delete, so
+    the pruned size is the honest network cost.
+
+    Exact criterion via biconnected decomposition: an edge is on a simple
+    s-t path iff its biconnected block lies on the block-cut-tree path
+    between s and t (within a 2-connected block, every edge admits a simple
+    path through it between any two block vertices).
+    """
+    edges = [e for e in g_tran if e[0] != e[1]]
+    if not edges:
+        return []
+
+    adj: List[List[Tuple[int, int]]] = [[] for _ in range(g_num)]
+    for i, e in enumerate(edges):
+        adj[e[0]].append((e[1], i))
+        adj[e[1]].append((e[0], i))
+
+    # ── Tarjan biconnected components (rooted at SRC=0) ────────────────────
+    disc = [0] * g_num
+    low = [0] * g_num
+    comp_of_edge = [-1] * len(edges)
+    is_cut = [False] * g_num
+    estack: List[int] = []
+    timer = [1]
+    ncomp = [0]
+
+    import sys
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old_limit, 4 * g_num + 100))
+
+    def _dfs(u: int, parent_eid: int) -> None:
+        disc[u] = low[u] = timer[0]
+        timer[0] += 1
+        children = 0
+        for v, i in adj[u]:
+            if i == parent_eid:
+                continue
+            if disc[v] == 0:
+                children += 1
+                estack.append(i)
+                _dfs(v, i)
+                low[u] = min(low[u], low[v])
+                if low[v] >= disc[u]:
+                    if disc[u] > 1 or children > 1:
+                        is_cut[u] = True
+                    c = ncomp[0]
+                    ncomp[0] += 1
+                    while True:
+                        j = estack.pop()
+                        comp_of_edge[j] = c
+                        if j == i:
+                            break
+            elif disc[v] < disc[u]:
+                estack.append(i)
+                low[u] = min(low[u], disc[v])
+
+    _dfs(0, -1)
+    sys.setrecursionlimit(old_limit)
+    if disc[1] == 0:
+        return []                    # SNK unreachable from SRC: nothing conducts
+
+    # ── Block-cut tree; keep blocks on the tree path SRC -> SNK ────────────
+    comp_verts: List[Set[int]] = [set() for _ in range(ncomp[0])]
+    for i, e in enumerate(edges):
+        if comp_of_edge[i] >= 0:
+            comp_verts[comp_of_edge[i]].update((e[0], e[1]))
+
+    # tree nodes: ("c", comp_id) and ("v", cut_vertex); leaves via membership
+    tree: Dict[Tuple[str, int], List[Tuple[str, int]]] = {}
+    for c in range(ncomp[0]):
+        cn = ("c", c)
+        tree.setdefault(cn, [])
+        for w in comp_verts[c]:
+            if is_cut[w]:
+                vn = ("v", w)
+                tree.setdefault(vn, [])
+                tree[cn].append(vn)
+                tree[vn].append(cn)
+
+    def _node_of(x: int) -> Tuple[str, int]:
+        if is_cut[x]:
+            return ("v", x)
+        for c in range(ncomp[0]):
+            if x in comp_verts[c]:
+                return ("c", c)
+        return ("v", x)              # isolated terminal (no conducting edges)
+
+    src_n, snk_n = _node_of(0), _node_of(1)
+    prev: Dict[Tuple[str, int], Tuple[str, int]] = {src_n: src_n}
+    q: deque = deque([src_n])
+    while q and snk_n not in prev:
+        n = q.popleft()
+        for nb in tree.get(n, []):
+            if nb not in prev:
+                prev[nb] = n
+                q.append(nb)
+    if snk_n not in prev:
+        return []
+
+    path_comps: Set[int] = set()
+    n = snk_n
+    while True:
+        if n[0] == "c":
+            path_comps.add(n[1])
+        if n == src_n:
+            break
+        n = prev[n]
+
+    return [e for i, e in enumerate(edges) if comp_of_edge[i] in path_comps]
+
+
+def prune_gtran_functional(g_tran, g_num: int, on_patterns) -> list:
+    """Greedy irredundant reduction: repeatedly remove any transistor whose
+    removal leaves every on-pattern covered.
+
+    Removing an edge can only REDUCE conduction, so off-pattern safety is
+    automatically preserved — the result computes exactly the same switching
+    function with <= transistors. Strictly subsumes prune_gtran (dead edges
+    never contribute coverage). Greedy, so the result is a (locally)
+    irredundant network, not necessarily the global minimum.
+    """
+    from .literal import covered_patterns
+
+    on_patterns = frozenset(on_patterns)
+    edges = prune_gtran(g_tran, g_num)      # cheap exact-topological pass first
+    changed = True
+    while changed:
+        changed = False
+        for i in range(len(edges)):
+            cand = edges[:i] + edges[i + 1:]
+            if covered_patterns(cand, g_num, on_patterns) == on_patterns:
+                # removal may orphan further structure — re-prune topologically
+                edges = prune_gtran(cand, g_num)
+                changed = True
+                break
+    return edges
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,6 +389,29 @@ def _assemble_graph(
         # Scalar (0-dim) tensor: pack() does unsqueeze(0) then cat → shape [B]
         graph.g_num_nodes = torch.tensor(g_num_nodes, dtype=torch.long)
 
+    return graph
+
+
+def assemble_graph_from_tensors(
+    edge_list: torch.Tensor,     # [E, 3] long
+    edge_feature: torch.Tensor,  # [E, EDGE_FEAT_DIM] float
+    node_feature: torch.Tensor,  # [N, NODE_FEAT_DIM] float
+    g_num_nodes,                 # int or 0-dim long tensor
+) -> td_data.Graph:
+    """Assemble a Graph directly from precomputed tensors (columnar dataset path).
+
+    Same result as `_assemble_graph` but with edge_list / node_feature / edge_feature
+    already materialised — no per-edge Python loops, no build_gen_graph recomputation.
+    """
+    n = int(node_feature.shape[0])
+    graph = td_data.Graph(edge_list=edge_list, num_node=n, num_relation=1)
+    with graph.edge():
+        graph.edge_feature = edge_feature
+    with graph.node():
+        graph.node_feature = node_feature
+    with graph.graph():
+        graph.g_num_nodes = (g_num_nodes if torch.is_tensor(g_num_nodes)
+                             else torch.tensor(g_num_nodes, dtype=torch.long))
     return graph
 
 

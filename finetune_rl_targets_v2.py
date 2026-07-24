@@ -67,9 +67,7 @@ def build_model(ck_path, device):
         edge_input_dim=EDGE_FEAT_DIM, num_layer=a.get("num_layer", 3),
         batch_norm=False,
     )
-    task = GCPNTransNet(mpnn, hidden_dim_mlp=a.get("mlp_hidden", 128),
-                        global_attn=a.get("global_attn", False),
-                        pointer_head=a.get("pointer_head", False)).to(device)
+    task = GCPNTransNet(mpnn, hidden_dim_mlp=a.get("mlp_hidden", 128)).to(device)
     base_state = copy.deepcopy(ck["model_state"])
     return task, base_state, a
 
@@ -94,9 +92,7 @@ def finetune_one(task, base_state, arch_args, vif, on_p, off_p, t_ref, fid, args
     task.train()
     for epoch in range(1, args.epochs + 1):
         opt.zero_grad()
-        rl_fn = (task.reinforce_forward_shaped if args.shaped
-                 else task.reinforce_forward)
-        ppo_loss = rl_fn(
+        ppo_loss = task.reinforce_forward_shaped(
             rl_input, num_traj=args.num_traj, max_steps=args.max_steps,
             temperature=args.temperature, clip_eps=args.clip_eps,
             lambda_entropy=args.lambda_entropy,
@@ -160,10 +156,6 @@ def main():
     p.add_argument("--lr",              type=float, default=3e-5)
     p.add_argument("--clip-eps",        type=float, default=0.2)
     p.add_argument("--lambda-entropy",  type=float, default=0.01)
-    p.add_argument("--shaped", action="store_true",
-                   help="Use reinforce_forward_shaped (partial-coverage credit) "
-                        "instead of terminal-only reward — needed when the base "
-                        "policy almost never completes a network (succ~0).")
     p.add_argument("--agent-sync-every",type=int,   default=10)
     p.add_argument("--eval-interval",   type=int,   default=50)
     p.add_argument("--eval-samples",    type=int,   default=20)

@@ -12,14 +12,19 @@ Edge feature encoding (N_VARS = 3 for sweep_3input):
   dim = N_VARS + 2 = 5
 """
 
+import os
 import re
 import itertools
 from collections import deque
 from typing import List, Tuple, FrozenSet
 
-ALL_VARS = ['a', 'b', 'c', 'd']  # max 4 variables (3-input uses first 3 only)
-N_VARS = len(ALL_VARS)            # 4
-EDGE_FEAT_DIM = N_VARS + 2        # 6
+# Variable set is configurable via the TRANSGPN_VARS env var so the same code
+# supports 4-input (default 'abcd') and 6-input ('abcdef') models. Must be set
+# BEFORE importing transnet. Old 4-input checkpoints require the default.
+ALL_VARS = list(os.environ.get("TRANSGPN_VARS", "abcd"))
+N_VARS = len(ALL_VARS)            # 4 by default, 6 for sweep_6input
+EDGE_FEAT_DIM = N_VARS + 2        # 6 by default, 8 for 6-input
+_VAR_CLASS = "[" + "".join(ALL_VARS) + "]"   # regex char class, e.g. [abcdef]
 
 
 # ---------------------------------------------------------------------------
@@ -28,7 +33,7 @@ EDGE_FEAT_DIM = N_VARS + 2        # 6
 
 def extract_vars(expr: str) -> List[str]:
     """Return sorted variable names that appear in SOP expression."""
-    return sorted(set(re.findall(r'[a-d]', expr)))
+    return sorted(set(re.findall(_VAR_CLASS, expr)))
 
 
 def decode_literal(lit_id: int, vars_in_func: List[str]) -> Tuple[int, int]:
@@ -74,7 +79,7 @@ def parse_sop_expr(expr: str, vars_in_func: List[str]) -> FrozenSet[Tuple[int, .
 
     for term in expr.split('+'):
         term = term.strip()
-        lits = re.findall(r'!?[a-d]', term)
+        lits = re.findall(r'!?' + _VAR_CLASS, term)
         # iterate over all K-local assignments
         for local_pat in itertools.product([0, 1], repeat=K):
             ctx = {vars_in_func[i]: local_pat[i] for i in range(K)}

@@ -35,3 +35,13 @@ results/rl_finetune/
 results/*.bak.csv
 checkpoints/rl_targets/
 checkpoints/rl_targets_val/
+
+# Large data caches / sweeps / archives (added during 3/4/6-input experiments)
+dataset/cache6_*/
+dataset/cache6_*.pt
+dataset/sweep_4input/
+dataset/sweep_6input_all/
+dataset/sweep_6input_possani/
+dataset/*.tar.gz
+dataset/_gbuild_tmp/
+pyeda/
